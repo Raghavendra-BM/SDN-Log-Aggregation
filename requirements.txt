@@ -1,0 +1,2 @@
+matplotlib
+# Ryu is installed by scripts/install_ryu.sh (the plain pip package does not install on current Python)

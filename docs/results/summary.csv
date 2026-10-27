@@ -1,0 +1,11 @@
+mode,scenario,event_s,baseline_logs_per_s,after_event_logs_per_s,min_logs_per_s_after,recovery_s,never_recovered,p95_delay_before_ms,p95_delay_after_ms,logs_written,logs_delivered,logs_undelivered,share_c1_pct,share_c2_pct,rogue_logs_accepted,detect_s,reaction_ms,acl_blocks
+dynamic,normal,12,115.6,117.8,61,0.0,False,106.1,104.0,5267,5267,0,50,50,0,,,0
+static,normal,12,115.1,118.2,83,0.0,False,101.1,78.6,5264,5264,0,100,0,0,,,0
+dynamic,link_failure,12,110.3,118.4,73,0.0,False,107.2,224.9,5300,5300,0,52,48,0,0.006,1.21,0
+static,link_failure,12,115,0,0,,True,109.2,0.0,5211,1338,3873,100,0,0,,,0
+dynamic,collector_failure,12,117.6,119.5,46,3.0,False,133.5,128.9,5298,5298,0,13,88,0,1.305,,0
+static,collector_failure,12,119.7,0,0,,True,179.1,0.0,5265,1399,3866,100,0,0,,,0
+dynamic,flood,12,110.1,121.5,50,2.0,False,165.7,303.2,5310,5310,0,50,50,0,1.558,,0
+static,flood,12,116.9,9.4,0,21.0,False,140.5,873.0,5316,5316,0,100,0,0,,,0
+dynamic,rogue,12,115.7,118,66,0.0,False,155.5,145.5,5345,5345,0,50,50,0,,,1
+static,rogue,12,121.7,117.2,82,0.0,False,120.0,62.5,5294,5294,0,100,0,1748,,,0

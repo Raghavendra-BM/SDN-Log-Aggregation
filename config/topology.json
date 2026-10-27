@@ -1,0 +1,35 @@
+{
+  "controller": {"ip": "127.0.0.1", "port": 6653},
+
+  "vip":     {"ip": "10.0.0.100", "mac": "00:00:00:00:01:00", "port": 9000},
+  "ctl_vip": {"ip": "10.0.0.250", "mac": "00:00:00:00:02:50", "port": 9100},
+
+  "switches": {"s1": 1, "s2": 2, "s3": 3, "s4": 4},
+
+  "hosts": {
+    "h1": {"ip": "10.0.0.1",  "mac": "00:00:00:00:00:01", "switch": "s1", "port": 1, "role": "source"},
+    "h2": {"ip": "10.0.0.2",  "mac": "00:00:00:00:00:02", "switch": "s1", "port": 2, "role": "source"},
+    "h3": {"ip": "10.0.0.3",  "mac": "00:00:00:00:00:03", "switch": "s1", "port": 3, "role": "source"},
+    "h4": {"ip": "10.0.0.4",  "mac": "00:00:00:00:00:04", "switch": "s1", "port": 4, "role": "attacker"},
+    "c1": {"ip": "10.0.0.11", "mac": "00:00:00:00:00:11", "switch": "s4", "port": 1, "role": "collector"},
+    "c2": {"ip": "10.0.0.12", "mac": "00:00:00:00:00:12", "switch": "s4", "port": 2, "role": "collector"}
+  },
+
+  "links": [
+    {"a": "s1", "a_port": 5, "b": "s2", "b_port": 1, "bw": 10, "delay": "5ms"},
+    {"a": "s2", "a_port": 2, "b": "s4", "b_port": 3, "bw": 10, "delay": "5ms"},
+    {"a": "s1", "a_port": 6, "b": "s3", "b_port": 1, "bw": 10, "delay": "20ms"},
+    {"a": "s3", "a_port": 2, "b": "s4", "b_port": 4, "bw": 10, "delay": "20ms"}
+  ],
+
+  "host_link": {"bw": 20, "delay": "1ms"},
+
+  "policy": {
+    "heartbeat_timeout_s": 1.5,
+    "flood_mbps": 3.0,
+    "flood_samples": 2,
+    "block_seconds": 30,
+    "stats_interval_s": 1.0,
+    "idle_timeout_s": 60
+  }
+}

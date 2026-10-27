@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+/results/
+!/docs/
+logs/
+checkpoint.json
+*.rejected.jsonl
+.env
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+build/
+
+# Local environment and secrets
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db
