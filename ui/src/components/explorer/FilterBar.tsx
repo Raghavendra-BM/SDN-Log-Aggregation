@@ -61,9 +61,11 @@ export function FilterBar({ filters, services, liveTail, onChange, onLiveTailCha
       </select>
       <select aria-label="Level" className={control} value={filters.level} onChange={(e) => onChange({ ...filters, level: e.target.value })}>
         <option value="">All levels</option>
-        <option value="INFO">INFO</option>
-        <option value="WARN">WARN</option>
+        <option value="CRITICAL">CRITICAL</option>
         <option value="ERROR">ERROR</option>
+        <option value="WARNING">WARNING</option>
+        <option value="INFO">INFO</option>
+        <option value="DEBUG">DEBUG</option>
       </select>
       <div className="relative min-w-56 flex-1 sm:max-w-sm">
         <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" strokeWidth={1.5} aria-hidden />

@@ -2,9 +2,9 @@
 The decision logic of the SDN controller, written as plain Python (no OpenFlow in here),
 so that it can be unit tested without a network:
 
-  Topology     the network graph, which links are up, shortest-path routes
-  BackendPool  the collectors behind the virtual IP: health from heartbeats, least-loaded choice
-  RateMonitor  flood detection from port byte counters
+  Topology            the network graph, which links are up, shortest-path routes
+  CongestionDetector  turns port byte counters into Mbit/s and decides when the network is congested
+                      (and when the congestion is over)
 """
 import heapq
 import json
@@ -94,81 +94,54 @@ class Topology:
         return path if cur == dst_switch else None
 
 
-# ====================================================================== the collectors behind the virtual IP
-class BackendPool:
-    """Tracks which collectors are alive (heartbeats) and picks the least-loaded one for a new connection."""
+# ====================================================================== congestion detection
+class CongestionDetector:
+    """Looks at the transmit counters of the core ports and decides whether the network is congested.
 
-    def __init__(self, backends, timeout, now=None):
-        """backends: list of (name, ip, mac)"""
-        t = time.time() if now is None else now
-        self.timeout = timeout
-        self.b = {}
-        for i, (name, ip, mac) in enumerate(backends):
-            self.b[name] = {"ip": ip, "mac": mac, "cookie": 0x100 + i, "last_hb": t, "alive": True,
-                            "pending": 0, "conns": 0, "assigned": 0, "served": 0}
+    * every call to update() turns a byte counter into Mbit/s for that port
+    * the network becomes CONGESTED when some port stays above `congestion_mbps` for `congestion_samples`
+      polls in a row
+    * it becomes CLEAR again only after ALL ports stayed below `clear_mbps` for `clear_samples` polls in a
+      row. The gap between the two thresholds (hysteresis) stops the controller from flapping on and off.
+    """
 
-    def heartbeat(self, name, info, now):
-        """Returns True if this collector was considered dead until now (it came back)."""
-        b = self.b.get(name)
-        if b is None:
-            return False
-        was_dead = not b["alive"]
-        b["last_hb"] = now
-        b["alive"] = True
-        b["pending"] = int(info.get("pending", 0))
-        b["conns"] = int(info.get("conns", 0))
-        return was_dead
+    def __init__(self, congestion_mbps, congestion_samples, clear_mbps, clear_samples):
+        self.hi, self.hi_n = congestion_mbps, congestion_samples
+        self.lo, self.lo_n = clear_mbps, clear_samples
+        self.last = {}                 # port key -> (time, tx_bytes)
+        self.rates = {}                # port key -> latest Mbit/s
+        self.congested = False
+        self._over = 0
+        self._quiet = 0
 
-    def is_alive(self, name, now):
-        b = self.b[name]
-        return b["alive"] and (now - b["last_hb"]) <= self.timeout
-
-    def expire(self, now):
-        """Mark collectors without a recent heartbeat as dead. Returns the names that just died."""
-        died = []
-        for name, b in self.b.items():
-            if b["alive"] and (now - b["last_hb"]) > self.timeout:
-                b["alive"] = False
-                died.append(name)
-        return died
-
-    def load(self, name):
-        b = self.b[name]
-        return b["assigned"] + b["pending"] / 500.0
-
-    def choose(self, now):
-        """Least-loaded live collector, or None. Counts the new connection against the choice."""
-        live = [n for n in self.b if self.is_alive(n, now)]
-        if not live:
-            return None
-        name = min(live, key=lambda n: (self.load(n), self.b[n]["served"], n))
-        self.b[name]["assigned"] += 1
-        self.b[name]["served"] += 1
-        return name
-
-    def release(self, name):
-        self.b[name]["assigned"] = max(0, self.b[name]["assigned"] - 1)
-
-
-# ====================================================================== flood detection
-class RateMonitor:
-    """Turns port byte counters into Mbit/s and decides when a port has been too busy for too long."""
-
-    def __init__(self, threshold_mbps, samples_needed):
-        self.threshold = threshold_mbps
-        self.needed = samples_needed
-        self.last = {}
-        self.over = {}
-
-    def update(self, key, rx_bytes, now):
-        """Returns (mbps, should_block)."""
+    def update(self, key, tx_bytes, now):
+        """Record one counter reading. Returns the port's rate in Mbit/s (0.0 for the first reading)."""
         prev = self.last.get(key)
-        self.last[key] = (now, rx_bytes)
-        if prev is None or now <= prev[0]:
-            return 0.0, False
-        mbps = (rx_bytes - prev[1]) * 8 / (now - prev[0]) / 1e6
-        self.over[key] = self.over.get(key, 0) + 1 if mbps > self.threshold else 0
-        if self.over[key] >= self.needed:
-            self.over[key] = 0
-            return mbps, True
-        return mbps, False
+        self.last[key] = (now, tx_bytes)
+        if prev is None or now <= prev[0] or tx_bytes < prev[1]:     # first reading, or the counter was reset
+            self.rates[key] = 0.0
+            return 0.0
+        mbps = (tx_bytes - prev[1]) * 8 / (now - prev[0]) / 1e6
+        self.rates[key] = mbps
+        return mbps
+
+    def evaluate(self):
+        """Call once after all ports of one polling round were updated.
+        Returns "start" or "end" when the state just changed, otherwise None."""
+        busiest = max(self.rates.values(), default=0.0)
+        self._over = self._over + 1 if busiest > self.hi else 0
+        self._quiet = self._quiet + 1 if busiest < self.lo else 0
+        if not self.congested and self._over >= self.hi_n:
+            self.congested, self._quiet = True, 0
+            return "start"
+        if self.congested and self._quiet >= self.lo_n:
+            self.congested, self._over = False, 0
+            return "end"
+        return None
+
+    def busiest(self):
+        """(port key, Mbit/s) of the busiest port in the latest round."""
+        if not self.rates:
+            return None, 0.0
+        key = max(self.rates, key=self.rates.get)
+        return key, self.rates[key]

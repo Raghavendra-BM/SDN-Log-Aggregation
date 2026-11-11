@@ -147,7 +147,7 @@ function LogExplorer() {
     async () => {
       try {
         const [s, errs, recent] = await Promise.all([fetchStats(mode), fetchRecentErrors(mode), fetchRecentLogs(mode)]);
-        setStats({ total: s.total_logs, queueSize: s.queue_size, errorsLastMinute: errs.count, logsPerMinute: recent.count });
+        setStats({ total: s.total_logs, lostLogs: s.lost_logs, errorsLastMinute: errs.count, logsPerMinute: s.logs_last_minute ?? recent.count });
       } catch {
         setStats(null);
       }

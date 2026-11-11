@@ -43,9 +43,10 @@ export function LogTable({ logs, freshIds, loading, error, onSelect, onUseDemo }
         <thead className="sticky top-0 z-10 bg-secondary text-left text-xs text-muted-foreground">
           <tr className="h-7 [&>th]:border-b [&>th]:px-3 [&>th]:font-medium">
             <th className="w-[150px]">Time</th>
-            <th className="w-[72px]">Level</th>
+            <th className="w-[96px]">Level</th>
             <th className="w-[96px]">Service</th>
             <th className="w-[80px]">Host</th>
+            <th className="w-[88px] text-right">Delay</th>
             <th>Message</th>
           </tr>
         </thead>
@@ -65,6 +66,9 @@ export function LogTable({ logs, freshIds, loading, error, onSelect, onUseDemo }
               <td><LevelBadge level={log.level} /></td>
               <td className="truncate">{log.service}</td>
               <td className="truncate text-muted-foreground">{log.host}</td>
+              <td className="whitespace-nowrap text-right font-mono text-xs tabular-nums text-muted-foreground">
+                {log.delay_ms === undefined ? "–" : `${log.delay_ms.toFixed(1)} ms`}
+              </td>
               <td className="truncate font-mono text-xs">{log.message}</td>
             </tr>
           ))}

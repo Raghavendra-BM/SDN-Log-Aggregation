@@ -7,8 +7,6 @@ __pycache__/
 /results/
 !/docs/
 logs/
-checkpoint.json
-*.rejected.jsonl
 .env
 
 # Frontend dependencies and build output

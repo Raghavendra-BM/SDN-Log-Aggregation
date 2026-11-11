@@ -33,9 +33,9 @@ export async function fetchStats(mode: DataMode): Promise<StatsResponse> {
 /** ISO string for "n seconds ago", in UTC. */
 export const secondsAgo = (n: number) => new Date(Date.now() - n * 1000).toISOString();
 
-/** Errors in the last 60 seconds. */
+/** CRITICAL logs in the last 60 seconds. */
 export function fetchRecentErrors(mode: DataMode) {
-  return fetchLogs(mode, { level: "ERROR", from: secondsAgo(60), limit: 1000 });
+  return fetchLogs(mode, { level: "CRITICAL", from: secondsAgo(60), limit: 1000 });
 }
 
 /** All logs in the last 60 seconds (used for "logs per minute"). */

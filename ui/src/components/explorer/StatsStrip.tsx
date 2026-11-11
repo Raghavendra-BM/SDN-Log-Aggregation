@@ -4,16 +4,16 @@ export interface Stats {
   total: number;
   errorsLastMinute: number;
   logsPerMinute: number;
-  queueSize: number;
+  lostLogs: number;
 }
 
 // Four plain figures in one row, separated by thin lines.
 export function StatsStrip({ stats }: { stats: Stats | null }) {
   const items = [
     { label: "Total logs", value: stats?.total },
-    { label: "Errors in last minute", value: stats?.errorsLastMinute, error: true },
+    { label: "Critical in last minute", value: stats?.errorsLastMinute, error: true },
     { label: "Logs per minute", value: stats?.logsPerMinute },
-    { label: "Queue size", value: stats?.queueSize },
+    { label: "Lost (from seq. gaps)", value: stats?.lostLogs },
   ];
   return (
     <dl className="grid grid-cols-2 divide-x border-b bg-card md:grid-cols-4">

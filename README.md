@@ -1,168 +1,137 @@
-# SDN-Assisted Distributed Log Aggregation over TCP
+# SDN-Assisted Distributed Logging over UDP: Prioritising Critical Logs under Congestion
 
-A log aggregation system (services -> agents -> collectors -> database) that runs on **raw TCP sockets** inside a
-**Mininet** network controlled by a **Ryu (OpenFlow 1.3) SDN controller**. The controller reacts to link failures,
-collector failures, floods and unauthorised hosts. Every dynamic feature is compared with a **static baseline**
-controller.
+Several hosts send their application logs over **UDP** to one central log server. When the network is congested,
+an **SDN controller (Ryu / OpenFlow 1.3)** makes sure the **critical** logs still get through, and the project
+measures how much that helps in packet loss and delivery time.
 
 ## The problem
+Develop a distributed logging system where multiple hosts send application logs using UDP. The SDN controller
+should prioritise critical logs during congestion.
 
-Services on many machines write their own logs. A central system must collect them without losing or duplicating
-any, even when a link breaks, a collector dies, or an attacker floods the network. With ordinary static forwarding
-rules, any of those events stops the log stream until a human intervenes.
+| Expectation | Where it is done |
+|---|---|
+| UDP log clients | `app/udp_client.py` (one per source host h1, h2, h3) |
+| Centralised log server | `app/log_server.py` on host `srv` |
+| Timestamps on logs | every datagram carries its send time; the server adds the receive time |
+| Categorise logs by severity | DEBUG, INFO, WARNING, ERROR, CRITICAL; the severity decides the UDP port (`common/udp_protocol.py`) |
+| Collect network-flow statistics | `sdn/controller.py`: port counters of all core links and flow counters per log class every 0.5 s |
+| Prioritise critical logs | controller puts critical and important logs into higher-priority queues during congestion |
+| Generate controlled congestion | `app/flooder.py` on host h4: UDP at a fixed rate (Mbit/s) towards the server |
+| Measure packet loss and delivery time | `experiments/run_experiments.py`, `experiments/udp_analysis.py` |
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph sources["log sources"]
-        h1["h1: service + agent"]
-        h2["h2: service + agent"]
-        h3["h3: service + agent"]
-        h4["h4: untrusted host"]
-    end
-    h1 & h2 & h3 & h4 --- s1((s1))
-    s1 ---|"fast path, 5 ms"| s2((s2))
-    s1 ---|"backup path, 20 ms"| s3((s3))
-    s2 --- s4((s4))
-    s3 --- s4
-    s4 --- c1["c1: collector"]
-    s4 --- c2["c2: collector"]
-    ctl["Ryu controller<br/>(OpenFlow 1.3)"] -. control .- s1 & s2 & s3 & s4
-    c1 & c2 -. "UDP heartbeat" .-> ctl
 ```
+  h1 h2 h3  (UDP log clients)      h4 (congestion generator)
+     \  |  /                      /
+        s1 ======= s2 =========== s4 --- srv (log server)     primary path   (5 ms links)
+        s1 ======= s3 =========== s4                          backup path    (20 ms links)
+                            |
+                   Ryu controller (outside Mininet, 127.0.0.1:6653)
+```
+All core links are 10 Mbit/s, host links 20 Mbit/s. The core link s1 to s2 is the **bottleneck**: the logs of h1..h3 and
+the flood of h4 meet there.
 
-Agents connect to a **virtual IP** (`10.0.0.100:9000`). The controller decides which real collector serves each TCP
-connection. Collectors report their health and load to the controller with UDP heartbeats to a second virtual
-address; the heartbeat arrives at the controller as an OpenFlow packet-in. This is the link between the socket
-application and the SDN network.
+### Log format and severity classes
+One log = one UDP datagram with a small JSON object: host, service, severity, sequence number, send time, message.
+No handshake, no acknowledgement, no retry. The severity decides the destination port, because a switch can match a UDP
+port but cannot read JSON:
 
-## Components
+| Severity | UDP port | Class | Queue on the switch ports |
+|---|---|---|---|
+| CRITICAL | 5001 | critical | 2 (highest priority) |
+| ERROR, WARNING | 5002 | important | 1 |
+| INFO, DEBUG | 5003 | normal | 0 (default) |
+| flood from h4 | 6000 | background | 0 (default) |
 
-| Part | File | What it does |
-|---|---|---|
-| Services | `app/service.py` | Write JSON logs with unique id and sequence number |
-| Agent | `app/agent.py` | TCP client: batching, checkpoint, reconnect, retry with backoff, connection rotation |
-| Collector | `app/collector.py` | TCP server (one thread per connection), acknowledges **after** the database commit, backpressure, heartbeats |
-| Protocol | `common/protocol.py` | Message framing: 4-byte length + JSON |
-| Flooder | `app/flooder.py` | UDP flood generator (the attack) |
-| Dashboard API | `app/query_api.py` | Read-only HTTP API that merges both collectors' databases and serves the controller's events |
-| Dashboard | `ui/` (optional) | Web dashboard: live logs, filters, alert banner |
-| Controller | `sdn/controller.py` | Ryu OpenFlow 1.3 app, `static` or `dynamic` mode |
-| Controller logic | `sdn/model.py` | Shortest-path routing, collector pool, flood detector (unit tested) |
-| Topology | `sdn/topo.py` + `config/topology.json` | Mininet network and application launcher |
-| Experiments | `experiments/` | Runs all scenarios in both modes, computes metrics, draws graphs |
+### What the controller does
+* **Static (baseline):** shortest-path routes only. Every packet leaves through the same first-in-first-out queue.
+* **Dynamic:**
+  1. *Statistics.* Every 0.5 s it reads the transmit counters of all core ports (Mbit/s) and the flow counters of the edge switch (packets and Mbit/s per log class).
+  2. *Congestion detection.* A port above 8 Mbit/s in two polls in a row means congestion. It is over when every port stayed below 5 Mbit/s for four polls (hysteresis, so it does not flap).
+  3. *Prioritisation.* The flow rules for ports 5001 to 5003 get a `set_queue` action: critical logs go into queue 2, important logs into queue 1. The queues are served by priority, so a full queue 0 cannot block critical logs. The rules are removed again after the congestion.
+  4. *Link failure (bonus).* Port-status events trigger a new shortest-path computation; the queue rules follow the new route.
 
-### TCP protocol
+  Every decision is written to `controller_events.jsonl` (one JSON line per event, plus one `stats` line per poll).
 
-Every message is `[4-byte length][JSON]`. Agent to collector: `{"type":"batch","logs":[...]}`. Replies:
-`ack` (logs are committed to the database), `busy` (overloaded, retry later), `error` (invalid or temporary).
-The agent moves its checkpoint forward only after an `ack`, so a log is never confirmed while it exists only in
-memory. Every log has a unique id, so a resend after a failure is harmless.
-
-## What the controller does
-
-| Mode | Behaviour |
-|---|---|
-| **static** (baseline) | Routes on the fast path installed once; the virtual IP always maps to collector c1; no reaction to anything |
-| **dynamic** | 1. **Link failure:** port-status event, shortest paths recomputed, routing table updated<br>2. **Load balancing:** first packet of every TCP connection goes to the controller, which picks the least-loaded live collector and installs NAT rules<br>3. **Health checks and failover:** no heartbeat for 1.5 s means the collector is dead, its rules are removed and reconnecting agents are sent to the other one<br>4. **Access control:** only authorised sources may use the virtual IP<br>5. **Flood defence:** port byte counters are polled every second; a host above 3 Mbit/s for 2 samples is quarantined for 30 s |
-
-OpenFlow pipeline: table 0 is the classifier (NAT, ACL, quarantine, punt to controller), table 1 routes by
-destination IP. Rerouting therefore only touches table 1 and the NAT rules never need to change.
+The queues themselves are created by `sdn/topo.py` (Open vSwitch QoS, linux-htb) in **both** modes, so the static baseline runs
+on exactly the same network; only the dynamic controller decides to use them.
 
 ## Install (Ubuntu 22.04 or 24.04)
-
 ```
-git clone <this repository>
-cd <repository>
 bash scripts/install_ubuntu.sh
 source .venv/bin/activate
-sudo mn --test pingall          # must end with 0% dropped
-python3 tests/test_model.py     # unit tests of the controller logic
+python3 tests/test_udp_local.py            # UDP client, log server and analysis (no Mininet needed)
+python3 tests/test_model.py                # routing and congestion-detector logic
+python3 tests/test_controller_logic.py     # controller logic against a fake Ryu
+python3 tests/test_query_api.py            # dashboard API
 ```
+The priority queues need the **kernel** datapath of Open vSwitch (do not use `--datapath user`).
 
 ## Run
-
-Open four terminals in the project folder (activate the environment in each: `source .venv/bin/activate`).
+Open four terminals in the project folder (activate the environment in each; terminals 3 and 4 are for the dashboard).
 
 | Terminal | Command |
 |---|---|
 | 1. Controller | `mkdir -p results/demo` then `SDN_MODE=dynamic EVENT_LOG=results/demo/controller_events.jsonl ryu-manager sdn/controller.py` |
 | 2. Network + applications | `sudo $(which python3) sdn/topo.py --demo` (gives a `mininet>` prompt) |
-| 3. Dashboard API (optional) | `python3 app/query_api.py --run-dir results/demo --events results/demo/controller_events.jsonl` |
-| 4. Dashboard (optional) | `cd ui && npm install && npm run dev`, open the address it prints and click **Live API** |
+| 3. Dashboard API | `python3 app/query_api.py --db results/demo/server.db --events results/demo/controller_events.jsonl` |
+| 4. Dashboard | `cd ui && npm install && npm run dev`, open the address it prints and click **Live API** |
 
-If your machine has no Open vSwitch kernel module, add `--datapath user` to the command in terminal 2.
-The demo starts every source at 2 logs per second so the dashboard stays readable (`--rate 10` for more traffic).
+The dashboard shows every log with its severity (DEBUG to CRITICAL), its delivery time in ms (the **Delay** column), the number of
+critical logs in the last minute and the number of lost logs (estimated from gaps in the sequence numbers). It is optional for the
+experiments but makes the live demo easy to follow: start a `flood 20 15` at the `mininet>` prompt and watch the Delay column and the
+lost-log counter, then compare with the static controller.
 
-The dashboard is optional: it makes the live demo easier to follow, but everything (logs, failover, graphs) also
-works without it. The dashboard code is the web UI from the earlier version of this project; it only needs an API
-at `http://127.0.0.1:8000` that answers `GET /logs` and `GET /stats`, which `app/query_api.py` provides.
-
-Smoke test (needs the controller running in terminal 1):
+Smoke test (controller in dynamic mode must be running in terminal 1, about 1 minute):
 ```
 sudo $(which python3) tests/smoke_mininet.py
 ```
 
 ## Live demo script
-
 At the `mininet>` prompt:
-
-| Step | Command | What to point out |
-|---|---|---|
-| Show the rules | `flows s1` | Table 0: NAT rules per connection. Table 1: routes |
-| Balanced collectors | `sh grep -c connected results/demo/collector_c1.out results/demo/collector_c2.out` | Both collectors serve agents |
-| Link failure | `link s1 s2 down` | Logs keep flowing over s3; check `flows s1` again |
-| Collector failure | `kill_collector c1` | Agents reconnect to c2 within seconds |
-| Flood | `flood 20` | h4 is quarantined after about 2 s (controller log: `flood_block`) |
-| Unauthorised host | `rogue` | h4's connection is dropped (controller log: `acl_block`) |
-| Watch it live | dashboard in the browser | Logs keep arriving during every failure |
-| Delivery check | `sh python3 experiments/analysis.py --run-dir results/demo` | 0 logs missing |
-
-Stop the services first and wait a few seconds before the delivery check, so the agents can finish sending.
+1. `report`: loss and delay per severity so far (should be 0% loss).
+2. `flows s1`: the log rules at priority 20 forward to port 5 with **no** `set_queue`.
+3. `flood 20 15`: h4 sends 15 Mbit/s for 20 s into a 10 Mbit/s link.
+4. After about 1 s: `flows s1` again. The rules now contain `set_queue:2`, `set_queue:1`, `set_queue:0`. Check the controller terminal for the `congestion_start` event.
+5. `queues`: packets and drops per queue; queue 0 (flood and normal logs) drops, the critical queue does not.
+6. After the flood: `report` (critical loss about 0%, normal logs lost), and after about 2 s `flows s1` shows the queue actions removed again.
 
 ## Experiments: static vs dynamic
-
 ```
-sudo $(which python3) experiments/run_experiments.py          # about 12 minutes, all scenarios
-python3 experiments/plot_results.py                            # graphs in results/plots/
+sudo $(which python3) experiments/run_experiments.py              # 4 congestion levels x 2 modes, about 8 minutes
+python3 experiments/plot_results.py                               # graphs in results/plots/
 ```
-Results are written to `results/summary.csv`. Scenarios: `normal`, `link_failure`, `collector_failure`, `flood`,
-`rogue`. Metrics: goodput (logs per second the collectors confirmed), recovery time, 95th percentile delivery
-delay, logs undelivered at the end, share per collector, rogue logs accepted, controller detection and reaction time.
+Each run: 40 s of logs from three hosts (100 logs/s each), h4 floods from second 10 for 20 s at 0, 8, 15 or 20 Mbit/s.
+The result table (`results/summary.csv`) covers the congested 20 s only: per severity the logs sent, received, loss %, and delivery time
+(mean, median, 95th percentile, maximum), plus the controller's reaction time. Delivery time = arrival time at the server minus the send
+time written by the client; all Mininet hosts share one clock, so this is the true one-way delay.
 
-| Scenario | Static controller | Dynamic controller |
-|---|---|---|
-| Link failure | [fill from summary.csv] | [fill from summary.csv] |
-| Collector failure | [fill] | [fill] |
-| UDP flood | [fill] | [fill] |
-| Unauthorised host | [fill] | [fill] |
-| Load balance (normal run) | [fill] | [fill] |
+Expected pattern: below 10 Mbit/s nothing is lost in either mode. Above it, the static network loses and delays **all** severities alike
+(the queue is shared), while the dynamic controller keeps CRITICAL loss near 0% with small delay and pushes the loss onto the normal logs and the
+background traffic. In the first second after the flood starts, before the controller reacts, critical logs are affected too (reaction time is in the table).
 
-All components run on one machine, so the figures show the behaviour of the design, not the limits of real hardware.
+## UDP and the timing difference to TCP
+UDP sends a log immediately: no handshake (TCP needs one extra round trip before the first data), no acknowledgements, no retransmission and no
+waiting behind a lost packet. So its delay is only propagation plus queuing. The price is that nothing repairs a lost log, and UDP does not slow
+down under congestion. That is why the network itself (the controller) has to protect the important logs. TCP would deliver every log, but late: a
+loss costs at least one more round trip (often 200 ms or more after a timeout) and TCP slows its sending when it sees congestion.
 
-## Reproducing the results
+## Project layout
+```
+app/udp_client.py     UDP log client (fake service)        app/log_server.py   central UDP log server (SQLite)
+app/flooder.py        congestion generator                 common/udp_protocol.py   datagram format, severity classes, ports
+sdn/controller.py     Ryu controller (static / dynamic)    sdn/model.py     routing + congestion detector (no Ryu needed)
+sdn/topo.py           Mininet topology, queues, apps       config/topology.json   topology, queues, thresholds
+experiments/          run_experiments.py, udp_analysis.py, plot_results.py
+app/query_api.py      dashboard API (reads server.db)       ui/              web dashboard
+tests/                test_udp_local, test_query_api, test_model, test_controller_logic, smoke_mininet
+```
+`app/query_api.py` serves the log server's database to the web dashboard in `ui/` (React, shows severity and delay).
 
-Everything needed is in this repository: topology (`config/topology.json`, `sdn/topo.py`), controller
-(`sdn/`), application (`app/`, `common/`), tests (`tests/`), experiment scripts (`experiments/`) and install
-scripts (`scripts/`). The commands above reproduce all results on a fresh Ubuntu machine.
-
-## Mapping to the evaluation criteria
-
-| Criterion | Where |
-|---|---|
-| Problem and architecture | This README, architecture diagram |
-| TCP socket implementation | `app/collector.py`, `app/agent.py`, `common/protocol.py`: framing, threads, timeouts, error handling, reconnect |
-| Mininet and SDN | `sdn/topo.py`, `config/topology.json`, `sdn/controller.py`: two-table OpenFlow pipeline |
-| Socket and SDN integration | Heartbeats from collectors become packet-in events; the controller steers new connections by collector load and health |
-| Dynamic SDN | Rerouting, load balancing, failover, access control, flood blocking |
-| Challenging scenarios | Link failure, collector kill, UDP flood, unauthorised host |
-| Performance evaluation | `experiments/`: static baseline against dynamic controller under five conditions |
-
-## Limitations and future work
-
-- SQLite and one thread per connection limit the throughput of a single collector.
-- The topology and host table come from a configuration file; discovering them with LLDP would make the controller
-  work on arbitrary networks.
-- Possible extensions: QoS queues that prioritise log traffic, TLS on the log connections, several controllers for
-  high availability.
+## Limitations
+* One log server, one bottleneck; the 10 Mbit/s links are an emulation, not real hardware.
+* Prioritisation works per UDP port, so a client that uses the wrong port is classified wrongly; nothing authenticates the sender.
+* The controller reacts after about 1 s (two polls of 0.5 s), so a very short burst can pass before the rules change.
+* Statistics come from polling, not from per-packet telemetry.
+* No retransmission: UDP logs that are dropped are gone. This is the intended trade-off of the assignment.

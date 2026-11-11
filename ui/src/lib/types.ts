@@ -1,6 +1,6 @@
 // Shared types for the log explorer. Shapes match the collector REST API exactly.
 
-export type Level = "INFO" | "WARN" | "ERROR";
+export type Level = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
 
 export interface LogEntry {
   row_id: number;
@@ -12,6 +12,7 @@ export interface LogEntry {
   host: string;
   seq: number;
   message: string;
+  delay_ms?: number; // delivery time: arrival at the log server minus the send time
 }
 
 export interface LogsResponse {
@@ -20,7 +21,8 @@ export interface LogsResponse {
 }
 
 export interface StatsResponse {
-  queue_size: number;
+  logs_last_minute?: number; // all logs received in the last 60 s (not capped by the page size)
+  lost_logs: number; // estimated from gaps in the sequence numbers
   total_logs: number;
   by_level: Record<Level, number>;
 }

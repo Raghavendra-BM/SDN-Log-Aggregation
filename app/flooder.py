@@ -14,7 +14,7 @@ import time
 def main():
     parser = argparse.ArgumentParser(description="UDP flood generator")
     parser.add_argument("--target", required=True, help="destination IP")
-    parser.add_argument("--port", type=int, default=5001)
+    parser.add_argument("--port", type=int, default=6000, help="6000 = the log server's sink port (not a log port)")
     parser.add_argument("--mbps", type=float, default=15.0, help="offered load in megabits per second")
     parser.add_argument("--seconds", type=float, default=20.0)
     args = parser.parse_args()

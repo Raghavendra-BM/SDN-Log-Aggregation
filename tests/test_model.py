@@ -6,11 +6,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "sdn"))
-from model import BackendPool, RateMonitor, Topology, load_config  # noqa: E402
+from model import CongestionDetector, Topology, load_config  # noqa: E402
 
 cfg = load_config(ROOT / "config" / "topology.json")
 S1, S2, S3, S4 = 1, 2, 3, 4
-H1, C1 = cfg["hosts"]["h1"]["ip"], cfg["hosts"]["c1"]["ip"]
+H1, C1 = cfg["hosts"]["h1"]["ip"], cfg["hosts"]["srv"]["ip"]
 
 
 def test_primary_path_is_the_fast_one():
@@ -54,42 +54,57 @@ def test_both_paths_down_means_no_route():
     assert C1 not in t.compute_routes()[S1]
 
 
-def test_pool_balances_and_fails_over():
-    pool = BackendPool([("c1", "10.0.0.11", "m1"), ("c2", "10.0.0.12", "m2")], timeout=1.5, now=100.0)
-    picks = [pool.choose(100.0) for _ in range(4)]
-    assert picks.count("c1") == 2 and picks.count("c2") == 2, picks      # spread evenly
-    pool.heartbeat("c1", {"pending": 0, "conns": 2}, 101.0)
-    pool.heartbeat("c2", {"pending": 0, "conns": 2}, 101.0)
-    assert pool.expire(101.5) == []
-    pool.heartbeat("c2", {"pending": 0}, 102.0)                          # c1 stops sending heartbeats
-    assert pool.expire(102.8) == ["c1"]
-    assert all(pool.choose(103.0) == "c2" for _ in range(3))             # only c2 is chosen now
-    assert pool.heartbeat("c1", {"pending": 0}, 104.0) is True           # c1 is back
-    assert pool.choose(104.0) == "c1"                                    # least loaded again
+def feed(det, t, mbps_by_port, last_bytes):
+    """One polling round: every port sends `mbps` for 0.5 s more than at the previous round."""
+    for port, mbps in mbps_by_port.items():
+        last_bytes[port] = last_bytes.get(port, 0) + int(mbps * 1e6 / 8 * 0.5)
+        det.update(port, last_bytes[port], t)
+    return det.evaluate()
 
 
-def test_pool_avoids_a_backlogged_collector():
-    pool = BackendPool([("c1", "a", "m"), ("c2", "b", "m")], timeout=5, now=0.0)
-    pool.heartbeat("c1", {"pending": 5000}, 1.0)
-    pool.heartbeat("c2", {"pending": 0}, 1.0)
-    assert pool.choose(1.0) == "c2"
+def test_congestion_starts_after_two_busy_rounds_and_ends_after_four_calm_ones():
+    det, b = CongestionDetector(8.0, 2, 5.0, 4), {}
+    t = 0.0
+    assert feed(det, t, {"p": 0.3}, b) is None                       # first reading: no rate yet
+    for _ in range(3):
+        t += 0.5
+        assert feed(det, t, {"p": 0.3}, b) is None                   # quiet
+    t += 0.5
+    assert feed(det, t, {"p": 9.5}, b) is None                       # one busy round is not enough
+    t += 0.5
+    assert feed(det, t, {"p": 9.6}, b) == "start" and det.congested  # two in a row
+    for _ in range(3):
+        t += 0.5
+        assert feed(det, t, {"p": 0.2}, b) is None and det.congested # calm, but not long enough yet
+    t += 0.5
+    assert feed(det, t, {"p": 0.2}, b) == "end" and not det.congested
 
 
-def test_no_live_backend():
-    pool = BackendPool([("c1", "a", "m")], timeout=1.0, now=0.0)
-    assert pool.choose(5.0) is None
+def test_hysteresis_between_the_two_thresholds_changes_nothing():
+    det, b = CongestionDetector(8.0, 2, 5.0, 4), {}
+    t = 0.0
+    feed(det, t, {"p": 0}, b)
+    for _ in range(2):
+        t += 0.5
+        r = feed(det, t, {"p": 9.0}, b)
+    assert r == "start"
+    for _ in range(10):                                              # 6 Mbit/s: below 8 but above 5
+        t += 0.5
+        assert feed(det, t, {"p": 6.0}, b) is None and det.congested
 
 
-def test_flood_detection():
-    m = RateMonitor(threshold_mbps=3.0, samples_needed=2)
-    assert m.update("p", 0, 0.0) == (0.0, False)
-    mbps, block = m.update("p", 125_000, 1.0)                # 1 Mbit/s: fine
-    assert round(mbps, 1) == 1.0 and not block
-    mbps, block = m.update("p", 125_000 + 1_875_000, 2.0)    # 15 Mbit/s: first sample over
-    assert round(mbps) == 15 and not block
-    mbps, block = m.update("p", 125_000 + 2 * 1_875_000, 3.0)
-    assert block                                             # second sample over: block
-    assert not m.update("p", 125_000 + 2 * 1_875_000 + 1000, 4.0)[1]   # quiet again
+def test_busiest_port_decides_and_is_reported():
+    det, b = CongestionDetector(8.0, 1, 5.0, 1), {}
+    feed(det, 0.0, {"a": 0, "b": 0}, b)
+    assert feed(det, 0.5, {"a": 1.0, "b": 9.9}, b) == "start"
+    key, mbps = det.busiest()
+    assert key == "b" and round(mbps, 1) == 9.9
+
+
+def test_counter_reset_is_not_a_negative_rate():
+    det = CongestionDetector(8.0, 2, 5.0, 4)
+    det.update("p", 1_000_000, 0.0)
+    assert det.update("p", 500, 1.0) == 0.0                          # the switch restarted: counter went down
 
 
 if __name__ == "__main__":

@@ -1,123 +1,114 @@
 """
-Read-only HTTP API for the web dashboard. It merges the databases of both collectors
-(c1.db and c2.db) and answers in the same format as the old single-collector API, so the
-existing dashboard works unchanged. It also serves the controller's event log.
+Read-only HTTP API for the web dashboard (ui/). It reads the log server's database (server.db) and the
+controller's event log, and answers in the format the dashboard expects.
 
-Run it on the Ubuntu machine itself (NOT inside Mininet):
+Run it on the Ubuntu machine itself (NOT inside Mininet), while the demo is running:
 
-    python3 app/query_api.py --run-dir results/demo --events results/demo/controller_events.jsonl
+    python3 app/query_api.py --db results/demo/server.db --events results/demo/controller_events.jsonl
 
     GET /logs?service=&level=&q=&from=&to=&since_id=&limit=   ->  {"count": n, "logs": [...]}   newest first
-    GET /stats                                                ->  totals, counts per level and per collector
-    GET /events?limit=50                                      ->  controller events (link down, backend down, flood block ...)
+    GET /stats                                                ->  totals, counts per severity, estimated lost logs
+    GET /events?limit=50                                      ->  controller events (congestion start/end, link failures)
+
+Every log carries delay_ms (delivery time) so the dashboard can show it.
 """
 import argparse
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-COLUMNS = "id, timestamp, received_at, service, level, host, trace_id, seq, message"
-COLLECTORS = ("c1", "c2")
+LEVEL_ALIASES = {"WARN": "WARNING"}          # the old dashboard said WARN
 
 
-def to_ms(iso):
-    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+def to_epoch(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
-def from_ms(ms):
-    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def make_row_id(received_at, local_rowid, collector_index):
-    """One id that grows with receive time across BOTH databases (needed for live tail with since_id).
-    Stays below 2^53, so JavaScript can hold it exactly."""
-    return to_ms(received_at) * 1000 + (local_rowid % 500) * 2 + collector_index
+def to_iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class Store:
-    def __init__(self, run_dir, events_path):
-        self.run_dir = Path(run_dir)
+    def __init__(self, db_path, events_path):
+        self.db_path = Path(db_path)
         self.events_path = Path(events_path) if events_path else None
 
-    def _connect(self, name):
-        path = self.run_dir / f"{name}.db"
-        if not path.exists():
+    def _connect(self):
+        if not self.db_path.exists():
             return None
-        conn = sqlite3.connect(path, timeout=5)
+        conn = sqlite3.connect(self.db_path, timeout=5)
         conn.row_factory = sqlite3.Row
         return conn
 
     def logs(self, q):
-        service, level, text = q.get("service"), q.get("level"), q.get("q")
-        t_from, t_to = q.get("from"), q.get("to")
-        since = int(q["since_id"]) if q.get("since_id") else None
+        conn = self._connect()
+        if conn is None:
+            return {"count": 0, "logs": []}
+        where, params = [], []
+        if q.get("service"):
+            where.append("service = ?"); params.append(q["service"])
+        if q.get("level"):
+            level = q["level"].upper()
+            where.append("severity = ?"); params.append(LEVEL_ALIASES.get(level, level))
+        if q.get("q"):
+            where.append("message LIKE ?"); params.append(f"%{q['q']}%")
+        if q.get("from"):
+            where.append("sent_at >= ?"); params.append(to_epoch(q["from"]))
+        if q.get("to"):
+            where.append("sent_at <= ?"); params.append(to_epoch(q["to"]))
+        if q.get("since_id"):
+            where.append("row_id > ?"); params.append(int(q["since_id"]))
         limit = max(1, min(int(q.get("limit", 100)), 1000))
-        out = []
-        for index, name in enumerate(COLLECTORS):
-            conn = self._connect(name)
-            if conn is None:
-                continue
-            where, params = [], []
-            if service:
-                where.append("service = ?"); params.append(service)
-            if level:
-                where.append("level = ?"); params.append(level.upper())
-            if text:
-                where.append("message LIKE ?"); params.append(f"%{text}%")
-            if t_from:
-                where.append("timestamp >= ?"); params.append(t_from)
-            if t_to:
-                where.append("timestamp <= ?"); params.append(t_to)
-            if since is not None:
-                where.append("received_at >= ?"); params.append(from_ms(since // 1000))
-            sql = f"SELECT row_id, {COLUMNS} FROM logs" + (" WHERE " + " AND ".join(where) if where else "")
-            sql += " ORDER BY row_id DESC LIMIT ?"
-            try:
-                for r in conn.execute(sql, params + [limit]):
-                    d = dict(r)
-                    d["collector"] = name
-                    d["row_id"] = make_row_id(d["received_at"], d["row_id"], index)
-                    if since is None or d["row_id"] > since:
-                        out.append(d)
-            except sqlite3.Error:
-                pass
-            finally:
-                conn.close()
-        out.sort(key=lambda d: d["row_id"], reverse=True)
-        return {"count": len(out[:limit]), "logs": out[:limit]}
+        sql = "SELECT row_id, host, service, severity, seq, sent_at, recv_at, delay_ms, message FROM logs"
+        sql += (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY row_id DESC LIMIT ?"
+        try:
+            rows = conn.execute(sql, params + [limit]).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            conn.close()
+        logs = [{"row_id": r["row_id"], "id": f"{r['host']}/{r['service']}/{r['severity']}/{r['seq']}",
+                 "timestamp": to_iso(r["sent_at"]), "received_at": to_iso(r["recv_at"]), "service": r["service"],
+                 "level": r["severity"], "host": r["host"], "seq": r["seq"], "message": r["message"],
+                 "delay_ms": r["delay_ms"]} for r in rows]
+        return {"count": len(logs), "logs": logs}
 
     def stats(self):
-        total, by_level, per_collector = 0, {}, {}
-        for name in COLLECTORS:
-            conn = self._connect(name)
-            per_collector[name] = 0
-            if conn is None:
-                continue
+        conn = self._connect()
+        by_level, total, lost, avg_delay, last_minute = {}, 0, 0, None, 0
+        if conn is not None:
             try:
-                for lvl, n in conn.execute("SELECT level, COUNT(*) FROM logs GROUP BY level"):
-                    by_level[lvl] = by_level.get(lvl, 0) + n
+                for sev, n in conn.execute("SELECT severity, COUNT(*) FROM logs GROUP BY severity"):
+                    by_level[sev] = n
                     total += n
-                    per_collector[name] += n
+                # a gap in the sequence numbers of one stream = a lost log
+                for (gap,) in conn.execute("SELECT MAX(seq) - COUNT(*) FROM logs GROUP BY host, service, severity"):
+                    lost += max(0, gap)
+                avg_delay = conn.execute("SELECT AVG(delay_ms) FROM logs").fetchone()[0]
+                last_minute = conn.execute("SELECT COUNT(*) FROM logs WHERE recv_at >= ?", (time.time() - 60,)).fetchone()[0]
             except sqlite3.Error:
                 pass
             finally:
                 conn.close()
-        return {"queue_size": 0, "total_logs": total, "by_level": by_level, "by_collector": per_collector}
+        return {"total_logs": total, "by_level": by_level, "lost_logs": lost, "logs_last_minute": last_minute,
+                "avg_delay_ms": round(avg_delay, 2) if avg_delay is not None else None}
 
     def events(self, limit):
         if not self.events_path or not self.events_path.exists():
             return {"events": []}
-        lines = self.events_path.read_text().splitlines()[-limit:]
         events = []
-        for line in lines:
+        for line in self.events_path.read_text().splitlines():
             try:
-                events.append(json.loads(line))
+                e = json.loads(line)
             except ValueError:
-                pass
-        return {"events": list(reversed(events))}
+                continue
+            if e.get("event") != "stats":                  # the per-poll statistics lines are too many for a list
+                events.append(e)
+        return {"events": list(reversed(events[-limit:]))}
 
 
 def make_handler(store):
@@ -149,7 +140,7 @@ def make_handler(store):
                 elif url.path == "/events":
                     self._send(200, store.events(int(q.get("limit", 50))))
                 elif url.path == "/":
-                    self._send(200, {"message": "SDN log query API", "endpoints": ["/logs", "/stats", "/events"]})
+                    self._send(200, {"message": "UDP log query API", "endpoints": ["/logs", "/stats", "/events"]})
                 else:
                     self._send(404, {"error": "not found"})
             except (ValueError, KeyError) as e:
@@ -163,13 +154,13 @@ def make_handler(store):
 
 def main():
     p = argparse.ArgumentParser(description="Read-only API for the dashboard")
-    p.add_argument("--run-dir", default="results/demo", help="folder that contains c1.db and c2.db")
+    p.add_argument("--db", default="results/demo/server.db", help="the log server's database")
     p.add_argument("--events", default=None, help="controller event log (jsonl)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(Store(args.run_dir, args.events)))
-    print(f"[query-api] http://{args.host}:{args.port}  reading {args.run_dir}", flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(Store(args.db, args.events)))
+    print(f"[query-api] http://{args.host}:{args.port}  reading {args.db}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
